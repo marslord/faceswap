@@ -14,7 +14,7 @@ import textwrap
 from importlib import import_module
 
 from lib.logger import crash_log, log_setup
-from lib.utils import FaceswapError, safe_shutdown
+from lib.utils import FaceswapError, get_backend, safe_shutdown
 from lib.model.masks import get_available_masks, get_default_mask
 from plugins.plugin_loader import PluginLoader
 
@@ -46,7 +46,7 @@ class ScriptExecutor():
     def test_for_tf_version():
         """ Check that the minimum required Tensorflow version is installed """
         min_ver = 1.12
-        max_ver = 1.13
+        max_ver = 1.14
         try:
             import tensorflow as tf
         except ImportError as err:
@@ -114,7 +114,7 @@ class ScriptExecutor():
         is_gui = hasattr(arguments, "redirect_gui") and arguments.redirect_gui
         log_setup(arguments.loglevel, arguments.logfile, self.command, is_gui)
         logger.debug("Executing: %s. PID: %s", self.command, os.getpid())
-        if hasattr(arguments, "amd") and arguments.amd:
+        if get_backend() == "amd":
             plaidml_found = self.setup_amd(arguments.loglevel)
             if not plaidml_found:
                 safe_shutdown()
@@ -357,6 +357,7 @@ class FaceSwapArgs():
         self.global_arguments = self.get_global_arguments()
         self.argument_list = self.get_argument_list()
         self.optional_arguments = self.get_optional_arguments()
+        self.process_suppressions()
         if not subparser:
             return
 
@@ -387,11 +388,6 @@ class FaceSwapArgs():
         """ Arguments that are used in ALL parts of Faceswap
             DO NOT override this """
         global_args = list()
-        global_args.append({"opts": ("-amd", "--amd"),
-                            "action": "store_true",
-                            "dest": "amd",
-                            "default": False,
-                            "help": "AMD GPU users must enable this option for PlaidML support"})
         global_args.append({"opts": ("-C", "--configfile"),
                             "action": FileFullPaths,
                             "filetypes": "ini",
@@ -443,6 +439,21 @@ class FaceSwapArgs():
                       for key in option.keys() if key != "opts"}
             self.parser.add_argument(*args, **kwargs)
 
+    def process_suppressions(self):
+        """ Suppress option if it is not available for running backend """
+        fs_backend = get_backend()
+        for opt_list in [self.global_arguments, self.argument_list, self.optional_arguments]:
+            for opts in opt_list:
+                if opts.get("backend", None) is None:
+                    continue
+                opt_backend = opts.pop("backend")
+                if isinstance(opt_backend, (list, tuple)):
+                    opt_backend = [backend.lower() for backend in opt_backend]
+                else:
+                    opt_backend = [opt_backend.lower()]
+                if fs_backend not in opt_backend:
+                    opts["help"] = argparse.SUPPRESS
+
 
 class ExtractConvertArgs(FaceSwapArgs):
     """ This class is used as a parent class to capture arguments that
@@ -477,7 +488,32 @@ class ExtractConvertArgs(FaceSwapArgs):
                               "filetypes": "alignments",
                               "type": str,
                               "dest": "alignments_path",
-                              "help": "Optional path to an alignments file."})
+                              "help": "Optional path to an alignments file. Leave blank if the "
+                                      "alignments file is at the default location."})
+        argument_list.append({"opts": ("-n", "--nfilter"),
+                              "action": FilesFullPaths,
+                              "filetypes": "image",
+                              "dest": "nfilter",
+                              "nargs": "+",
+                              "default": None,
+                              "help": "Optionally filter out people who you do not wish to "
+                                      "process by passing in an image of that person. Should be a "
+                                      "front portrait with a single person in the image. Multiple "
+                                      "images can be added space separated. NB: Using face filter "
+                                      "will significantly decrease extraction speed and its "
+                                      "accuracy cannot be guaranteed."})
+        argument_list.append({"opts": ("-f", "--filter"),
+                              "action": FilesFullPaths,
+                              "filetypes": "image",
+                              "dest": "filter",
+                              "nargs": "+",
+                              "default": None,
+                              "help": "Optionally select people you wish to process by passing in "
+                                      "an image of that person. Should be a front portrait with a "
+                                      "single person in the image. Multiple images can be added "
+                                      "space separated. NB: Using face filter will significantly "
+                                      "decrease extraction speed and its accuracy cannot be "
+                                      "guaranteed."})
         argument_list.append({"opts": ("-l", "--ref_threshold"),
                               "action": Slider,
                               "min_max": (0.01, 0.99),
@@ -485,31 +521,11 @@ class ExtractConvertArgs(FaceSwapArgs):
                               "type": float,
                               "dest": "ref_threshold",
                               "default": 0.4,
-                              "help": "Threshold for positive face recognition. For use with "
-                                      "nfilter or filter. Lower values are stricter. NB: Using "
-                                      "face filter will significantly decrease extraction speed."})
-        argument_list.append({"opts": ("-n", "--nfilter"),
-                              "action": FilesFullPaths,
-                              "filetypes": "image",
-                              "dest": "nfilter",
-                              "nargs": "+",
-                              "default": None,
-                              "help": "Reference image for the persons you do not want to "
-                                      "process. Should be a front portrait with a single person "
-                                      "in the image. Multiple images can be added space "
-                                      "separated. NB: Using face filter will significantly "
-                                      "decrease extraction speed."})
-        argument_list.append({"opts": ("-f", "--filter"),
-                              "action": FilesFullPaths,
-                              "filetypes": "image",
-                              "dest": "filter",
-                              "nargs": "+",
-                              "default": None,
-                              "help": "Reference images for the person you want to process. "
-                                      "Should be a front portrait with a single person in the "
-                                      "image. Multiple images can be added space separated. NB: "
-                                      "Using face filter will significantly decrease extraction "
-                                      "speed."})
+                              "help": "For use with the optional nfilter/filter files. Threshold "
+                                      "for positive face recognition. Lower values are stricter. "
+                                      "NB: Using face filter will significantly decrease "
+                                      "extraction speed and its accuracy cannot be "
+                                      "guaranteed."})
         return argument_list
 
 
@@ -522,47 +538,58 @@ class ExtractArgs(ExtractConvertArgs):
     def get_optional_arguments():
         """ Put the arguments in a list so that they are accessible from both
         argparse and gui """
+        backend = get_backend()
         argument_list = []
         argument_list.append({"opts": ("--serializer", ),
                               "type": str.lower,
                               "dest": "serializer",
                               "default": "json",
                               "choices": ("json", "pickle", "yaml"),
-                              "help": "Serializer for alignments file. If "
-                                      "yaml is chosen and not available, then "
-                                      "json will be used as the default "
+                              "help": "Serializer for alignments file. If yaml is chosen and not "
+                                      "available, then json will be used as the default "
                                       "fallback."})
+        s3fd = "s3fd"
+        fan = "fan"
+        if backend == "cpu":
+            default_detector = default_aligner = "cv2-dnn"
+        else:
+            default_detector = s3fd
+            default_aligner = fan
+        if backend == "amd":
+            default_detector += "-amd"
+            default_aligner += "-amd"
+            s3fd += "-amd"
+            fan += "-amd"
+
         argument_list.append({
             "opts": ("-D", "--detector"),
             "action": Radio,
             "type": str.lower,
             "choices":  PluginLoader.get_available_extractors("detect"),
-            "default": "mtcnn",
-            "help": "R|Detector to use. NB: Unless stated, all aligners will run on CPU for AMD "
-                    "GPUs. Some of these have configurable settings in "
+            "default": default_detector,
+            "help": "R|Detector to use. Some of these have configurable settings in "
                     "'/config/extract.ini' or 'Edit > Configure Extract Plugins':"
                     "\nL|'cv2-dnn': A CPU only extractor, is the least reliable, but uses least "
                     "resources and runs fast on CPU. Use this if not using a GPU and time is "
                     "important."
                     "\nL|'mtcnn': Fast on GPU, slow on CPU. Uses fewer resources than other GPU "
-                    "detectors but can often return more false positives."
-                    "\nL|'s3fd': Fast on GPU, slow on CPU. Can detect more faces and fewer false "
-                    "positives than other GPU detectors, but is a lot more resource intensive."})
+                    "detectors but can often return more false positives. NB: Runs on CPU for AMD "
+                    "cards."
+                    "\nL|'" + s3fd + "': Fast on GPU, slow on CPU. Can detect more faces and "
+                    "fewer false positives than other GPU detectors, but is a lot more resource "
+                    "intensive."})
         argument_list.append({
             "opts": ("-A", "--aligner"),
             "action": Radio,
             "type": str.lower,
             "choices": PluginLoader.get_available_extractors("align"),
-            "default": "fan",
-            "help": "R|Aligner to use. NB: Unless stated, all aligners will run on CPU for AMD "
-                    "GPUs."
+            "default": default_aligner,
+            "help": "R|Aligner to use."
                     "\nL|'cv2-dnn': A cpu only CNN based landmark detector. Faster, less "
                     "resource intensive, but less accurate. Only use this if not using a gpu "
                     " and time is important."
-                    "\nL|'fan': Face Alignment Network. Best aligner. GPU heavy, slow when not "
-                    "running on GPU"
-                    "\nL|'fan-amd': Face Alignment Network. Uses Keras backend to support AMD "
-                    "Cards. Best aligner. GPU heavy, slow when not running on GPU"})
+                    "\nL|'" + fan + "': Face Alignment Network. Best aligner. GPU "
+                    "heavy, slow when not running on GPU"})
         argument_list.append({"opts": ("-nm", "--normalization"),
                               "action": Radio,
                               "type": str.lower,
@@ -572,7 +599,8 @@ class ExtractArgs(ExtractConvertArgs):
                               "help": "R|Performing normalization can help the aligner better "
                                       "align faces with difficult lighting conditions at an "
                                       "extraction speed cost. Different methods will yield "
-                                      "different results on different sets."
+                                      "different results on different sets. NB: This does not "
+                                      "impact the output face, just the input to the aligner."
                                       "\nL|'none': Don't perform normalization on the face."
                                       "\nL|'clahe': Perform Contrast Limited Adaptive Histogram "
                                       "Equalization on the face."
@@ -582,13 +610,11 @@ class ExtractArgs(ExtractConvertArgs):
                               "type": str,
                               "dest": "rotate_images",
                               "default": None,
-                              "help": "If a face isn't found, rotate the "
-                                      "images to try to find a face. Can find "
-                                      "more faces at the cost of extraction "
-                                      "speed. Pass in a single number to use "
-                                      "increments of that size up to 360, or "
-                                      "pass in a list of numbers to enumerate "
-                                      "exactly what angles to check"})
+                              "help": "If a face isn't found, rotate the images to try to find a "
+                                      "face. Can find more faces at the cost of extraction speed. "
+                                      "Pass in a single number to use increments of that size up "
+                                      "to 360, or pass in a list of numbers to enumerate exactly "
+                                      "what angles to check"})
         argument_list.append({"opts": ("-bt", "--blur-threshold"),
                               "type": float,
                               "action": Slider,
@@ -603,13 +629,10 @@ class ExtractArgs(ExtractConvertArgs):
         argument_list.append({"opts": ("-sp", "--singleprocess"),
                               "action": "store_true",
                               "default": False,
+                              "backend": "nvidia",
                               "help": "Don't run extraction in parallel. Will run detection first "
-                                      "then alignment (2 passes). Useful if VRAM is at a premium. "
-                                      "Only has an effect if both the aligner and detector use "
-                                      "the GPU, otherwise this is automatically off. NB: AMD "
-                                      "cards do not support parallel processing, so if both "
-                                      "aligner and detector use an AMD GPU this will "
-                                      "automatically be enabled."})
+                                      "then alignment (2 passes). Useful if VRAM is at a "
+                                      "premium."})
         argument_list.append({"opts": ("-sz", "--size"),
                               "type": int,
                               "action": Slider,
@@ -644,29 +667,25 @@ class ExtractArgs(ExtractConvertArgs):
                               "action": "store_true",
                               "dest": "skip_existing",
                               "default": False,
-                              "help": "Skips frames that have already been "
-                                      "extracted and exist in the alignments "
-                                      "file"})
+                              "help": "Skips frames that have already been extracted and exist in "
+                                      "the alignments file"})
         argument_list.append({"opts": ("-sf", "--skip-existing-faces"),
                               "action": "store_true",
                               "dest": "skip_faces",
                               "default": False,
-                              "help": "Skip frames that already have "
-                                      "detected faces in the alignments "
-                                      "file"})
+                              "help": "Skip frames that already have detected faces in the "
+                                      "alignments file"})
         argument_list.append({"opts": ("-dl", "--debug-landmarks"),
                               "action": "store_true",
                               "dest": "debug_landmarks",
                               "default": False,
-                              "help": "Draw landmarks on the ouput faces for "
-                                      "debug"})
+                              "help": "Draw landmarks on the ouput faces for debugging purposes."})
         argument_list.append({"opts": ("-ae", "--align-eyes"),
                               "action": "store_true",
                               "dest": "align_eyes",
                               "default": False,
-                              "help": "Perform extra alignment to ensure "
-                                      "left/right eyes are  at the same "
-                                      "height"})
+                              "help": "Perform extra alignment to ensure left/right eyes are at "
+                                      "the same height"})
         argument_list.append({"opts": ("-si", "--save-interval"),
                               "dest": "save_interval",
                               "type": int,
@@ -675,10 +694,12 @@ class ExtractArgs(ExtractConvertArgs):
                               "rounding": 10,
                               "default": 0,
                               "help": "Automatically save the alignments file after a set amount "
-                                      "of frames. Will only save at the end of extracting by "
-                                      "default. WARNING: Don't interrupt the script when writing "
-                                      "the file because it might get corrupted. Set to 0 to turn "
-                                      "off"})
+                                      "of frames. By default the alignments file is only saved at "
+                                      "the end of the extraction process. NB: If extracting in 2 "
+                                      "passes then the alignments file will only start to be "
+                                      "saved out during the second pass. WARNING: Don't interrupt "
+                                      "the script when writing the file because it might get "
+                                      "corrupted. Set to 0 to turn off"})
         return argument_list
 
 
@@ -696,28 +717,8 @@ class ConvertArgs(ExtractConvertArgs):
                               "action": DirFullPaths,
                               "dest": "model_dir",
                               "required": True,
-                              "help": "Model directory. A directory containing the trained model "
-                                      "you wish to process."})
-        argument_list.append({"opts": ("-a", "--input-aligned-dir"),
-                              "action": DirFullPaths,
-                              "dest": "input_aligned_dir",
-                              "default": None,
-                              "help": "Input \"aligned directory\". A "
-                                      "directory that should contain the "
-                                      "aligned faces extracted from the input "
-                                      "files. If you delete faces from this "
-                                      "folder, they'll be skipped during "
-                                      "conversion. If no aligned dir is "
-                                      "specified, all faces will be "
-                                      "converted"})
-        argument_list.append({"opts": ("-ref", "--reference-video"),
-                              "action": FileFullPaths,
-                              "dest": "reference_video",
-                              "filetypes": "video",
-                              "type": str,
-                              "help": "Only required if converting from images to video. Provide "
-                                      "The original video that the source frames were extracted "
-                                      "from (for extracting the fps and audio)."})
+                              "help": "Model directory. The directory containing the trained "
+                                      "model you wish to use for conversion."})
         argument_list.append({
             "opts": ("-c", "--color-adjustment"),
             "action": Radio,
@@ -816,19 +817,41 @@ class ConvertArgs(ExtractConvertArgs):
                                       "singleprocess is enabled this setting will be ignored."})
         argument_list.append({"opts": ("-g", "--gpus"),
                               "type": int,
+                              "backend": "nvidia",
                               "action": Slider,
                               "min_max": (1, 10),
                               "rounding": 1,
                               "default": 1,
                               "help": "Number of GPUs to use for conversion"})
+        argument_list.append({"opts": ("-a", "--input-aligned-dir"),
+                              "action": DirFullPaths,
+                              "dest": "input_aligned_dir",
+                              "default": None,
+                              "help": "If you have not cleansed your alignments file, then you "
+                                      "can filter out faces by defining a folder here that "
+                                      "contains the faces extracted from your input files/video. "
+                                      "If this folder is defined, then only faces that exist "
+                                      "within your alignments file and also exist within the "
+                                      "specified folder will be converted. Leaving this blank "
+                                      "will convert all faces that exist within the alignments "
+                                      "file."})
+        argument_list.append({"opts": ("-ref", "--reference-video"),
+                              "action": FileFullPaths,
+                              "dest": "reference_video",
+                              "filetypes": "video",
+                              "type": str,
+                              "help": "Only required if converting from images to video. Provide "
+                                      "The original video that the source frames were extracted "
+                                      "from (for extracting the fps and audio)."})
         argument_list.append({"opts": ("-fr", "--frame-ranges"),
                               "nargs": "+",
                               "type": str,
-                              "help": "frame ranges to apply transfer to e.g. For frames 10 to 50 "
-                                      "and 90 to 100 use --frame-ranges 10-50 90-100. Files "
-                                      "must have the frame-number as the last number in the name! "
-                                      "Frames falling outside of the selected range will be "
-                                      "discarded unless '-k' (--keep-unchanged) is selected."})
+                              "help": "Frame ranges to apply transfer to e.g. For frames 10 to 50 "
+                                      "and 90 to 100 use --frame-ranges 10-50 90-100. Frames "
+                                      "falling outside of the selected range will be discarded "
+                                      "unless '-k' (--keep-unchanged) is selected. NB: If you are "
+                                      "converting from images, then the filenames must end with "
+                                      "the frame-number!"})
         argument_list.append({"opts": ("-k", "--keep-unchanged"),
                               "action": "store_true",
                               "dest": "keep_unchanged",
@@ -839,8 +862,8 @@ class ConvertArgs(ExtractConvertArgs):
                               "action": "store_true",
                               "dest": "swap_model",
                               "default": False,
-                              "help": "Swap the model. Instead of A -> B, "
-                                      "swap B -> A"})
+                              "help": "Swap the model. Instead converting from of A -> B, "
+                                      "converts B -> A"})
         argument_list.append({"opts": ("-sp", "--singleprocess"),
                               "action": "store_true",
                               "default": False,
@@ -869,7 +892,8 @@ class TrainArgs(FaceSwapArgs):
                               "dest": "input_a",
                               "required": True,
                               "help": "Input directory. A directory containing training images "
-                                      "for face A."})
+                                      "for face A. This is the original face, i.e. the face that "
+                                      "you want to remove and replace with face B."})
         argument_list.append({"opts": ("-ala", "--alignments-A"),
                               "action": FileFullPaths,
                               "filetypes": 'alignments',
@@ -884,19 +908,19 @@ class TrainArgs(FaceSwapArgs):
                               "action": DirFullPaths,
                               "dest": "timelapse_input_a",
                               "default": None,
-                              "help": "For if you want a timelapse: "
-                                      "The input folder for the timelapse. "
-                                      "This folder should contain faces of A "
-                                      "which will be converted for the "
-                                      "timelapse. You must supply a "
-                                      "--timelapse-output and a "
-                                      "--timelapse-input-B parameter."})
+                              "help": "Optional for creating a timelapse. Timelapse will save an "
+                                      "image of your selected faces into the timelapse-output "
+                                      "folder at every save iteration. This should be the "
+                                      "input folder of 'A' faces that you would like to use for "
+                                      "creating the timelapse. You must also supply a "
+                                      "--timelapse-output and a --timelapse-input-B parameter."})
         argument_list.append({"opts": ("-B", "--input-B"),
                               "action": DirFullPaths,
                               "dest": "input_b",
                               "required": True,
                               "help": "Input directory. A directory containing training images "
-                                      "for face B."})
+                                      "for face B. This is the swap face, i.e. the face that "
+                                      "you want to place onto the head of person A."})
         argument_list.append({"opts": ("-alb", "--alignments-B"),
                               "action": FileFullPaths,
                               "filetypes": 'alignments',
@@ -911,13 +935,31 @@ class TrainArgs(FaceSwapArgs):
                               "action": DirFullPaths,
                               "dest": "timelapse_input_b",
                               "default": None,
-                              "help": "For if you want a timelapse: "
-                                      "The input folder for the timelapse. "
-                                      "This folder should contain faces of B "
-                                      "which will be converted for the "
-                                      "timelapse. You must supply a "
-                                      "--timelapse-output and a "
-                                      "--timelapse-input-A parameter."})
+                              "help": "Optional for creating a timelapse. Timelapse will save an "
+                                      "image of your selected faces into the timelapse-output "
+                                      "folder at every save iteration. This should be the "
+                                      "input folder of 'B' faces that you would like to use for "
+                                      "creating the timelapse. You must also supply a "
+                                      "--timelapse-output and a --timelapse-input-A parameter."})
+        argument_list.append({"opts": ("-to", "--timelapse-output"),
+                              "action": DirFullPaths,
+                              "dest": "timelapse_output",
+                              "default": None,
+                              "help": "Optional for creating a timelapse. Timelapse will save an "
+                                      "image of your selected faces into the timelapse-output "
+                                      "folder at every save iteration. If the input folders are "
+                                      "supplied but no output folder, it will default to your "
+                                      "model folder /timelapse/"})
+        argument_list.append({"opts": ("-m", "--model-dir"),
+                              "action": DirFullPaths,
+                              "dest": "model_dir",
+                              "required": True,
+                              "help": "Model directory. This is where the training data will be "
+                                      "stored. You should always specify a new folder for new "
+                                      "models. If starting a new model, select either an empty "
+                                      "folder, or a folder which does not exist (which will be "
+                                      "created). If continuing to train an existing model, "
+                                      "specify the location of the existing model."})
         argument_list.append({"opts": ("-t", "--trainer"),
                               "action": Radio,
                               "type": str.lower,
@@ -929,6 +971,7 @@ class TrainArgs(FaceSwapArgs):
                                       "\nL|dfaker: 64px in/128px out model from dfaker. "
                                       "Enable 'warp-to-landmarks' for full dfaker method."
                                       "\nL|dfl-h128. 128px in/out model from deepfacelab"
+                                      "\nL|dfl-sae. Adaptable model from deepfacelab"
                                       "\nL|iae: A model that uses intermediate layers to try to "
                                       "get better details"
                                       "\nL|lightweight: A lightweight model for low-end cards. "
@@ -944,20 +987,6 @@ class TrainArgs(FaceSwapArgs):
                                       "\nL|villain: 128px in/out model from villainguy. Very "
                                       "resource hungry (11GB for batchsize 16). Good for "
                                       "details, but more susceptible to color differences."})
-        argument_list.append({"opts": ("-to", "--timelapse-output"),
-                              "action": DirFullPaths,
-                              "dest": "timelapse_output",
-                              "default": None,
-                              "help": "The output folder for the timelapse. "
-                                      "If the input folders are supplied but "
-                                      "no output folder, it will default to "
-                                      "your model folder /timelapse/"})
-        argument_list.append({"opts": ("-m", "--model-dir"),
-                              "action": DirFullPaths,
-                              "dest": "model_dir",
-                              "required": True,
-                              "help": "Model directory. This is where the training data will be "
-                                      "stored."})
         argument_list.append({"opts": ("-s", "--save-interval"),
                               "type": int,
                               "action": Slider,
@@ -965,7 +994,7 @@ class TrainArgs(FaceSwapArgs):
                               "rounding": 10,
                               "dest": "save_interval",
                               "default": 100,
-                              "help": "Sets the number of iterations before saving the model"})
+                              "help": "Sets the number of iterations between each model save."})
         argument_list.append({"opts": ("-ss", "--snapshot-interval"),
                               "type": int,
                               "action": Slider,
@@ -983,16 +1012,24 @@ class TrainArgs(FaceSwapArgs):
                               "rounding": 2,
                               "dest": "batch_size",
                               "default": 64,
-                              "help": "Batch size, as a power of 2 (64, 128, 256, etc)"})
+                              "help": "Batch size. This is the number of images processed through "
+                                      "the model for each iteration. Larger batches require more "
+                                      "GPU RAM."})
         argument_list.append({"opts": ("-it", "--iterations"),
                               "type": int,
                               "action": Slider,
                               "min_max": (0, 5000000),
                               "rounding": 20000,
                               "default": 1000000,
-                              "help": "Length of training in iterations."})
+                              "help": "Length of training in iterations. This is only really used "
+                                      "for automation. There is no 'correct' number of iterations "
+                                      "a model should be trained for. You should stop training "
+                                      "when you are happy with the previews. However, if you want "
+                                      "the model to stop automatically at a set number of "
+                                      "iterations, you can set that value here."})
         argument_list.append({"opts": ("-g", "--gpus"),
                               "type": int,
+                              "backend": "nvidia",
                               "action": Slider,
                               "min_max": (1, 10),
                               "rounding": 1,
@@ -1021,8 +1058,9 @@ class TrainArgs(FaceSwapArgs):
                               "action": "store_true",
                               "dest": "allow_growth",
                               "default": False,
-                              "help": "Sets allow_growth option of Tensorflow "
-                                      "to spare memory on some configs"})
+                              "backend": "nvidia",
+                              "help": "Sets allow_growth option of Tensorflow to spare memory "
+                                      "on some configurations."})
         argument_list.append({"opts": ("-nl", "--no-logs"),
                               "action": "store_true",
                               "dest": "no_logs",
@@ -1034,29 +1072,32 @@ class TrainArgs(FaceSwapArgs):
                               "action": "store_true",
                               "dest": "memory_saving_gradients",
                               "default": False,
-                              "help": "[Nvidia only] Trades off VRAM usage against computation "
-                                      "time. Can fit larger models into memory at a cost of "
-                                      "slower training speed. 50%%-150%% batch size increase for "
-                                      "20%%-50%% longer training time. NB: Launch time will be "
-                                      "significantly delayed. Switching sides using ping-pong "
-                                      "training will take longer."})
+                              "backend": "nvidia",
+                              "help": "Trades off VRAM usage against computation time. Can fit "
+                                      "larger models into memory at a cost of slower training "
+                                      "speed. 50%%-150%% batch size increase for 20%%-50%% longer "
+                                      "training time. NB: Launch time will be significantly "
+                                      "delayed. Switching sides using ping-pong training will "
+                                      "take longer."})
         argument_list.append({"opts": ("-o", "--optimizer-savings"),
                               "dest": "optimizer_savings",
                               "action": "store_true",
                               "default": False,
-                              "help": "[Nvidia only] To save VRAM some optimizer gradient "
-                                      "calculations can be performed on the CPU rather than the "
-                                      "GPU. This allows you to increase batchsize at a training "
-                                      "speed cost."})
+                              "backend": "nvidia",
+                              "help": "To save VRAM some optimizer gradient calculations can be "
+                                      "performed on the CPU rather than the GPU. This allows you "
+                                      "to increase batchsize at a training speed/system RAM "
+                                      "cost."})
         argument_list.append({"opts": ("-pp", "--ping-pong"),
                               "action": "store_true",
                               "dest": "pingpong",
                               "default": False,
-                              "help": "[Nvidia only] Enable ping pong training. Trains one side "
-                                      "at a time, switching sides at each save iteration. "
-                                      "Training will take 2 to 4 times longer, with about a "
-                                      "30%%-50%% reduction in VRAM useage. NB: Preview won't show "
-                                      "until both sides have been trained once."})
+                              "backend": "nvidia",
+                              "help": "Enable ping pong training. Trains one side at a time, "
+                                      "switching sides at each save iteration. Training will "
+                                      "take 2 to 4 times longer, with about a 30%%-50%% reduction "
+                                      "in VRAM useage. NB: Preview won't show until both sides "
+                                      "have been trained once."})
         argument_list.append({"opts": ("-wl", "--warp-to-landmarks"),
                               "action": "store_true",
                               "dest": "warp_to_landmarks",

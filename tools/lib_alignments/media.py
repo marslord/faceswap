@@ -93,6 +93,7 @@ class MediaLoader():
     def __init__(self, folder):
         logger.debug("Initializing %s: (folder: '%s')", self.__class__.__name__, folder)
         logger.info("[%s DATA]", self.__class__.__name__.upper())
+        self._count = None
         self.folder = folder
         self.vid_reader = self.check_input_folder()
         self.file_list_sorted = self.sorted_items()
@@ -108,11 +109,13 @@ class MediaLoader():
     @property
     def count(self):
         """ Number of faces or frames """
+        if self._count is not None:
+            return self._count
         if self.is_video:
-            retval = int(count_frames_and_secs(self.folder)[0])
+            self._count = int(count_frames_and_secs(self.folder)[0])
         else:
-            retval = len(self.file_list_sorted)
-        return retval
+            self._count = len(self.file_list_sorted)
+        return self._count
 
     def check_input_folder(self):
         """ makes sure that the frames or faces folder exists
